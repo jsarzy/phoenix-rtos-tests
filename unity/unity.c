@@ -5,7 +5,6 @@
 ============================================================================ */
 
 #include "unity.h"
-#include <stddef.h>
 
 #ifdef AVR
 #include <avr/pgmspace.h>

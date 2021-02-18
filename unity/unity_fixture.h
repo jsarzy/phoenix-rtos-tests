@@ -12,12 +12,7 @@
 #include "unity_internals.h"
 #include "unity_fixture_internals.h"
 
-#ifndef UNITY_FIXTURE_NO_EXTRAS
-#include "unity_memory.h"
-#endif
-
-int UnityMain(int argc, const char* argv[], void (*runAllTests)(void));
-
+int UnityMain(const char* namespace, void (*runAllTests)(void), int verbose);
 
 #define TEST_GROUP(group)\
     static const char* TEST_GROUP_##group = #group
@@ -27,7 +22,6 @@ int UnityMain(int argc, const char* argv[], void (*runAllTests)(void));
 
 #define TEST_TEAR_DOWN(group) void TEST_##group##_TEAR_DOWN(void);\
     void TEST_##group##_TEAR_DOWN(void)
-
 
 #define TEST(group, name) \
     void TEST_##group##_##name##_(void);\
@@ -64,8 +58,10 @@ int UnityMain(int argc, const char* argv[], void (*runAllTests)(void));
 
 /* Call this from main */
 #define RUN_TEST_GROUP(group)\
-    { void TEST_##group##_GROUP_RUNNER(void);\
-      TEST_##group##_GROUP_RUNNER(); }
+	TEST_##group##_GROUP_RUNNER()
+
+#define DECLARE_TEST_GROUP(group)\
+	void __attribute__((weak)) TEST_##group##_GROUP_RUNNER(void) {}
 
 /* CppUTest Compatibility Macros */
 #ifndef UNITY_EXCLUDE_CPPUTEST_ASSERTS
