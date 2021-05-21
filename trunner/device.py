@@ -11,9 +11,10 @@ import serial
 try:
     import RPi.GPIO
 except ImportError:
-    print("RPi.GPIO module can't be imported!")
+    pass
 
 from .config import PHRTOS_PROJECT_DIR, DEVICE_SERIAL
+from .tools.color import Color
 
 
 _BOOT_DIR = PHRTOS_PROJECT_DIR / '_boot'
@@ -37,6 +38,151 @@ def proccess_log_output(proc):
             break
         if output:
             logging.info(output)
+
+
+class Psu:
+    """Wrapper for psu program"""
+
+    def __init__(self, script, cwd=_BOOT_DIR):
+        self.script = script
+        self.cwd = cwd
+        self.proc = None
+
+    def run(self):
+        self.proc = subprocess.Popen(
+            ['psu', f'{self.script}'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=self.cwd
+        )
+
+        proccess_log_output(self.proc)
+        self.proc.wait()
+        if self.proc.returncode != 0:
+            logging.error(f'Command {" ".join(self.proc.args)} with pid {self.proc.pid} failed!\n')
+            raise Exception('Flashing IMXRT106x failed\n')
+
+
+class Phoenixd:
+    """ Wrapper for phoenixd program"""
+
+    def __init__(
+        self,
+        port,
+        baudrate=460800,
+        dir='.',
+        cwd=_BOOT_DIR
+    ):
+        self.port = port
+        self.baudrate = baudrate
+        self.dir = dir
+        self.cwd = cwd
+        self.proc = None
+
+    def run(self):
+        self.proc = subprocess.Popen([
+            'phoenixd',
+            '-p', self.port,
+            '-b', str(self.baudrate),
+            '-s', self.dir],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=self.cwd,
+            preexec_fn=os.setpgrp
+        )
+
+        # Wait for phoenixd dispatcher being ready
+        time.sleep(1)
+
+        return self.proc
+
+    def kill(self):
+        os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+
+    def __enter__(self):
+        return self.run()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.kill()
+
+
+class PloError(Exception):
+    def __init__(self, message, expected):
+        msg = Color.colorify("PLO ERROR:\n", Color.BOLD)
+        msg += str(message) + '\n'
+        if expected:
+            msg += Color.colorify("EXPECTED:\n", Color.BOLD)
+            msg += str(expected) + '\n'
+
+        super().__init__(msg)
+
+
+class PloTalker:
+    """Interface to communicate with plo"""
+
+    def __init__(self, port, baudrate=115200):
+        self.port = port
+        self.baudrate = baudrate
+        self.serial = None
+        self.plo = None
+
+    def open(self):
+        try:
+            self.serial = serial.Serial(self.port, baudrate=self.baudrate)
+        except serial.SerialException:
+            logging.error(f'Port {self.port} not available\n')
+            raise
+
+        self.plo = pexpect.fdpexpect.fdspawn(self.serial, timeout=8)
+        return self
+
+    def close(self):
+        self.serial.close()
+
+    def __enter__(self):
+        return self.open()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def wait_prompt(self, timeout=8):
+        self.plo.expect_exact("(plo)% ", timeout=timeout)
+
+    def expect_prompt(self, timeout=8):
+        looking_for = [r"\(plo\)% ", r"(.*?)\n"]
+        idx = self.plo.expect(looking_for, timeout=timeout)
+        if idx == 1:
+            # Something else than prompt was printed, raise error
+            line = self.plo.match.group(0)
+            raise PloError(line, expected=looking_for[0])
+
+    def cmd(self, cmd, timeout=8):
+        self.plo.send(cmd + '\r\n')
+        # Wait for an eoched command
+        self.plo.expect_exact(cmd)
+        # There might be some ASCII escape characters, we wait only for a new line
+        self.plo.expect_exact('\n', timeout=timeout)
+
+    def app(self, device, file, imap, dmap, exec=False):
+        exec = '-x' if exec else ''
+        self.cmd(f'app {device} {exec} {file} {imap} {dmap}', timeout=30)
+        self.expect_prompt()
+
+    def copy(self, src, src_obj, dst, dst_obj, src_size='', dst_size=''):
+        self.cmd(f'copy {src} {src_obj} {src_size} {dst} {dst_obj} {dst_size}', timeout=60)
+        self.expect_prompt()
+
+    def copy_file2mem(self, src, file, dst='flash1', off=0, size=0):
+        self.copy(
+            src=src,
+            src_obj=file,
+            dst=dst,
+            dst_obj=off,
+            dst_size=size
+        )
+
+    def go(self):
+        self.plo.send('go!\r\n')
 
 
 class Runner:
@@ -77,7 +223,7 @@ class DeviceRunner(Runner):
 
 
 class GPIO:
-    """Wrappee around the RPi.GPIO module. It represents a single OUT pin"""
+    """Wrapper around the RPi.GPIO module. It represents a single OUT pin"""
 
     def __init__(self, pin):
         self.pin = pin
@@ -101,7 +247,7 @@ class IMXRT106xRunner(DeviceRunner):
     SDP = 'plo-ram-armv7m7-imxrt106x.sdp'
     IMAGE = 'phoenix-armv7m7-imxrt106x.disk'
 
-    def __init__(self, port, phoenixd_port='/dev/ttyUSB0'):
+    def __init__(self, port, phoenixd_port='/dev/ttyACM1'):
         super().__init__(port)
         self.phoenixd_port = phoenixd_port
         self.reset_gpio = GPIO(17)
@@ -124,61 +270,45 @@ class IMXRT106xRunner(DeviceRunner):
     def flash(self):
         self.boot(serial_downloader=True)
 
-        logging.info("psu run!\n")
+        Psu(script=self.SDP).run()
 
-        psu = subprocess.Popen(
-            ['psu', f'{self.SDP}'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=_BOOT_DIR
-        )
-
-        proccess_log_output(psu)
-        psu.wait()
-        if psu.returncode != 0:
-            logging.error(f'Command {" ".join(psu.args)} with pid {psu.pid} failed!\n')
-            raise Exception('Flashing IMXRT106x failed\n')
-
-        phoenixd = subprocess.Popen([
-            'phoenixd',
-            '-p', self.phoenixd_port,
-            '-b', '115200',
-            '-s', '.'],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT,
-            cwd=_BOOT_DIR,
-            preexec_fn=os.setpgrp
-        )
-
-        logging.info("phoenixd run!\n")
-
-        try:
-            target_serial = serial.Serial(self.port, baudrate=115200)
-        except serial.SerialException:
-            logging.error(f'Port {self.port} not available\n')
-            raise
-
-        plo = pexpect.fdpexpect.fdspawn(target_serial)
-
-        try:
-            plo.expect_exact("(plo)% ")
-            logging.info(f"Copying {self.IMAGE} to target\n")
-            plo.send(f"copy com1 {self.IMAGE} flash0 0 0\r\n")
-            plo.expect_exact("Finished copying", timeout=60)
-            logging.info(f"Finished copying {self.IMAGE} to target\n")
-            plo.expect_exact("(plo)% ")
-        except pexpect.exceptions.TIMEOUT:
-            target_serial.close()
-            os.killpg(os.getpgid(phoenixd.pid), signal.SIGTERM)
-            raise
+        with PloTalker(self.port) as plo:
+            plo.wait_prompt()
+            # Wait for usb0
+            time.sleep(1)
+            with Phoenixd(self.phoenixd_port):
+                plo.copy_file2mem(
+                    src='usb0',
+                    file=self.IMAGE,
+                    dst='flash1',
+                    off=0
+                )
 
         self.boot()
-
-        target_serial.close()
-        os.killpg(os.getpgid(phoenixd.pid), signal.SIGTERM)
 
     def run(self, test):
-        self.boot()
+        if test.skipped():
+            return
+
+        # Load test ELF using plo
+        try:
+            with PloTalker(self.port) as plo:
+                self.boot()
+                plo.wait_prompt()
+                # Wait for usb0
+                time.sleep(1)
+                with Phoenixd(self.phoenixd_port, dir='test'):
+                    plo.app('usb0', test.exec_bin, 'ocram2', 'ocram2')
+                    plo.go()
+        except (pexpect.exceptions.TIMEOUT, pexpect.exceptions.EOF) as exc:
+            test.exception = Color.colorify('EXCEPTION PLO\n', Color.BOLD)
+            test.handle_pyexpect_error(plo.plo, exc)
+            return
+        except PloError as exc:
+            test.exception = str(exc)
+            test.fail()
+            return
+
         super().run(test)
 
 
