@@ -2,6 +2,7 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 import time
 
 import pexpect
@@ -16,6 +17,7 @@ except ImportError:
 from .config import PHRTOS_PROJECT_DIR, DEVICE_SERIAL
 from .tools.color import Color
 
+import threading
 
 _BOOT_DIR = PHRTOS_PROJECT_DIR / '_boot'
 
@@ -31,13 +33,8 @@ QEMU_CMD = {
 }
 
 
-def proccess_log_output(proc):
-    while True:
-        output = proc.stdout.readline().decode('utf-8')
-        if proc.poll() is not None and output == '':
-            break
-        if output:
-            logging.info(output)
+def is_github_actions():
+    return os.getenv('GITHUB_ACTIONS', False)
 
 
 class Psu:
@@ -48,15 +45,29 @@ class Psu:
         self.cwd = cwd
         self.proc = None
 
+    def read_output(self):
+        if is_github_actions():
+            logging.info('::group::psu\n')
+
+        while True:
+            line = self.proc.stdout.readline().decode('utf-8')
+            if not line:
+                break
+
+            logging.info(line)
+
+        if is_github_actions():
+            logging.info('::endgroup::\n')
+
     def run(self):
         self.proc = subprocess.Popen(
             ['psu', f'{self.script}'],
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             cwd=self.cwd
         )
 
-        proccess_log_output(self.proc)
+        self.read_output()
         self.proc.wait()
         if self.proc.returncode != 0:
             logging.error(f'Command {" ".join(self.proc.args)} with pid {self.proc.pid} failed!\n')
@@ -71,36 +82,74 @@ class Phoenixd:
         port,
         baudrate=460800,
         dir='.',
-        cwd=_BOOT_DIR
+        cwd=_BOOT_DIR,
+        wait_dispatcher=True
     ):
         self.port = port
         self.baudrate = baudrate
         self.dir = dir
         self.cwd = cwd
         self.proc = None
+        self.reader_thread = None
+        self.reader_lock = None
+        self.wait_dispatcher = wait_dispatcher
+        self.output_buffer = ''
+
+    def _reader(self, print_output=False):
+        while True:
+            line = self.proc.readline()
+            if not line:
+                break
+
+            if self.wait_dispatcher:
+                msg = f'Starting message dispatcher on [{self.port}] (speed={self.baudrate})'
+                if msg in line:
+                    self.wait_dispatcher = False
+                    self.reader_lock.release()
+
+            if print_output:
+                print(line, end='')
+
+            self.output_buffer += line
 
     def run(self):
-        self.proc = subprocess.Popen([
+        self.proc = pexpect.spawn(
             'phoenixd',
-            '-p', self.port,
-            '-b', str(self.baudrate),
-            '-s', self.dir],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            ['-p', self.port,
+             '-b', str(self.baudrate),
+             '-s', self.dir],
             cwd=self.cwd,
-            preexec_fn=os.setpgrp
+            encoding='utf-8'
         )
 
-        # Wait for phoenixd dispatcher being ready
-        time.sleep(1)
+        if self.wait_dispatcher:
+            self.reader_lock = threading.Lock()
+            self.reader_lock.acquire()
+
+        self.reader_thread = threading.Thread(target=self._reader)
+        self.reader_thread.start()
+
+        if self.wait_dispatcher:
+            self.reader_lock.acquire()
 
         return self.proc
 
+    def output(self):
+        output = self.output_buffer
+        if is_github_actions():
+            output = '::group::Pheonixd\n' + output + '::endgroup::\n'
+
+        return output
+
     def kill(self):
         os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+        self.reader_thread.join()
+        if self.reader_lock.locked():
+            self.reader_lock.release()
 
     def __enter__(self):
-        return self.run()
+        self.run()
+        return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.kill()
@@ -149,12 +198,11 @@ class PloTalker:
         self.plo.expect_exact("(plo)% ", timeout=timeout)
 
     def expect_prompt(self, timeout=8):
-        looking_for = [r"\(plo\)% ", r"(.*?)\n"]
-        idx = self.plo.expect(looking_for, timeout=timeout)
+        idx = self.plo.expect([r"\(plo\)% ", r"(.*?)\n"], timeout=timeout)
         if idx == 1:
             # Something else than prompt was printed, raise error
             line = self.plo.match.group(0)
-            raise PloError(line, expected=looking_for[0])
+            raise PloError(line, expected="(plo)% ")
 
     def cmd(self, cmd, timeout=8):
         self.plo.send(cmd + '\r\n')
@@ -272,41 +320,57 @@ class IMXRT106xRunner(DeviceRunner):
 
         Psu(script=self.SDP).run()
 
-        with PloTalker(self.port) as plo:
-            plo.wait_prompt()
-            # Wait for usb0
-            time.sleep(1)
-            with Phoenixd(self.phoenixd_port):
-                plo.copy_file2mem(
-                    src='usb0',
-                    file=self.IMAGE,
-                    dst='flash1',
-                    off=0
-                )
+        try:
+            with PloTalker(self.port) as plo:
+                plo.wait_prompt()
+                with Phoenixd(self.phoenixd_port) as phd:
+                    plo.copy_file2mem(
+                        src='usb0',
+                        file=self.IMAGE,
+                        dst='flash1',
+                        off=0
+                    )
+        except PloError as exc:
+            exception = str(exc)
+            if phd:
+                exception += Color.colorify('\nPHOENIXD OUTPUT:\n', Color.BOLD)
+                exception += phd.output()
+            logging.info(exception)
+            sys.exit(1)
 
         self.boot()
+
+    def load(self, test):
+        """Loads test ELF into syspage using plo"""
+        load_dir = 'test/armv7m7-imxrt106x'
+
+        try:
+            with PloTalker(self.port) as plo:
+                self.boot()
+                plo.wait_prompt()
+                with Phoenixd(self.phoenixd_port, dir=load_dir) as phd:
+                    plo.app('usb0', test.exec_bin, 'ocram2', 'ocram2')
+                    plo.go()
+        except (pexpect.exceptions.TIMEOUT, pexpect.exceptions.EOF, PloError) as exc:
+            if isinstance(exc, PloError):
+                test.exception = str(exc)
+                test.fail()
+            else:  # TIMEOUT or EOF
+                test.exception = Color.colorify('EXCEPTION PLO\n', Color.BOLD)
+                test.handle_pyexpect_error(plo.plo, exc)
+
+            if phd:
+                test.exception += Color.colorify('\nPHOENIXD OUTPUT:\n', Color.BOLD)
+                test.exception += phd.output()
+            return False
+
+        return True
 
     def run(self, test):
         if test.skipped():
             return
 
-        # Load test ELF using plo
-        try:
-            with PloTalker(self.port) as plo:
-                self.boot()
-                plo.wait_prompt()
-                # Wait for usb0
-                time.sleep(1)
-                with Phoenixd(self.phoenixd_port, dir='test'):
-                    plo.app('usb0', test.exec_bin, 'ocram2', 'ocram2')
-                    plo.go()
-        except (pexpect.exceptions.TIMEOUT, pexpect.exceptions.EOF) as exc:
-            test.exception = Color.colorify('EXCEPTION PLO\n', Color.BOLD)
-            test.handle_pyexpect_error(plo.plo, exc)
-            return
-        except PloError as exc:
-            test.exception = str(exc)
-            test.fail()
+        if not self.load(test):
             return
 
         super().run(test)
