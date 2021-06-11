@@ -1,4 +1,3 @@
-import logging
 import os
 import pathlib
 
@@ -43,18 +42,34 @@ class TestConfig(dict):
         self.update(**config)
 
     def join_targets(self, config: 'TestConfig') -> None:
-        if not config.get('targets'):
+        if 'targets' not in config:
+            return
+        elif 'targets' not in self:
+            self['targets'] = config['targets']
             return
 
-        value = array_value(config['targets'])
-        if not self.get('targets'):
-            self.setdefault('targets', {'value': value})
-        else:
-            self['targets'].setdefault('value', value)
+        if 'value' in self['targets']:
+            # We have defined value of targets in our config. Do not overwrite it, just return
+            return
 
-        #value = array_value(config['targets'])
-        #self.setdefault('targets', {})
-        #self['targets'].setdefault('value', value)
+        targets = dict(config['targets'])
+        targets.setdefault('value', ALL_TARGETS)
+        value = array_value(targets)
+        self['targets']['value'] = value
+
+    #def join_targets(self, config: 'TestConfig') -> None:
+    #    if not config.get('targets'):
+    #        return
+
+    #    value = array_value(config['targets'])
+    #    if not self.get('targets'):
+    #        self.setdefault('targets', {'value': value})
+    #    else:
+    #        self['targets'].setdefault('value', value)
+
+    #    #value = array_value(config['targets'])
+    #    #self.setdefault('targets', {})
+    #    #self['targets'].setdefault('value', value)
 
     def join(self, config: 'TestConfig') -> None:
         self.join_targets(config)
@@ -97,21 +112,32 @@ class TestConfigParser:
     def __init__(self, path: pathlib.Path) -> None:
         self.path: pathlib.Path = path
 
-    def parse_keywords(self, config: TestConfig, check_required_keys: bool = True) -> None:
+    def set_default_targets(self, config: TestConfig) -> None:
+        targets = config.get('targets', dict())
+        targets.setdefault('value', DEFAULT_TARGETS)
+        config['targets'] = targets
+
+    def set_defaults(self, config: TestConfig) -> None:
+        config.setdefault('ignore', False)
+        config.setdefault('type', 'unit')
+        config.setdefault('timeout', PYEXPECT_TIMEOUT)
+        self.set_default_targets(config)
+
+    def parse_keywords(self, config: TestConfig) -> None:
         keywords = set(config)
         uknown = keywords - self.ALLOWED_KEYS
         if uknown:
             raise ParserError(f'Uknown keys: {", ".join(map(str, uknown))}')
 
-        if not check_required_keys:
+    def parse_type(self, config: TestConfig) -> None:
+        allowed_types = ('unit', 'harness')
+        test_type = config.get('type')
+        if not test_type:
             return
 
-        required = keywords & self.REQUIRED_KEYS ^ self.REQUIRED_KEYS
-        if required:
-            raise ParserError(f'Missing required keys: {", ".join(required)}')
-
-    def parse_type(self, config: TestConfig) -> None:
-        config.setdefault('type', 'unit')
+        if test_type not in allowed_types:
+            msg = f'wrong test type: {test_type}. Allowed types: {", ".join(allowed_types)}'
+            raise ParserError(msg)
 
     def parse_harness(self, config: TestConfig) -> None:
         harness = config.get('harness')
@@ -134,10 +160,16 @@ class TestConfigParser:
         if not isinstance(ignore, bool):
             raise ParserError(f'ignore must be a boolean value (true/false) not {ignore}')
 
-        config['ignore'] = ignore
-
     def parse_timeout(self, config: TestConfig) -> None:
-        config.setdefault('timeout', PYEXPECT_TIMEOUT)
+        timeout = config.get('timeout')
+        if not timeout:
+            return
+
+        if not isinstance(timeout, int):
+            try:
+                timeout = int(timeout)
+            except ValueError:
+                raise ParserError(f'wrong timeout: {timeout}. It must be an integer with base 10')
 
     @staticmethod
     def is_array(array):
@@ -146,19 +178,18 @@ class TestConfigParser:
             raise ParserError(f'array: unknown keys: {", ".join(map(str, unknown))}')
 
     def parse_targets(self, config: TestConfig) -> None:
-        targets = config.get('targets', dict())
-        targets.setdefault('value', DEFAULT_TARGETS)
-        TestConfigParser.is_array(targets)
+        targets = config.get('targets')
+        if not targets:
+            return
 
+        TestConfigParser.is_array(targets)
         for value in targets.values():
             unknown = set(value) - set(ALL_TARGETS)
             if unknown:
                 raise ParserError(f'targets {", ".join(map(str, unknown))} are uknown')
 
-        config['targets'] = targets
-
     def parse(self, config: TestConfig, check_required_keys=True) -> None:
-        self.parse_keywords(config, check_required_keys)
+        self.parse_keywords(config)
         self.parse_targets(config)
         self.parse_harness(config)
         self.parse_type(config)
@@ -172,18 +203,17 @@ class ConfigParser:
         self.targets: List[str] = targets
         self.dir_path = path.parents[0]
         self.parser: TestConfigParser = TestConfigParser(self.dir_path)
-        self.config: Dict[str, Any] = None
-        self.minor_config: TestConfig = None
+        self.main_config: TestConfig = None
         self.tests: List[TestConfig] = []
 
-    def load(self) -> None:
+    def load(self) -> Dict[str, Any]:
         with open(self.path, 'r') as f_yaml:
-            self.config = yaml.safe_load(f_yaml)
+            config = yaml.safe_load(f_yaml)
 
-        return self.config
+        return config
 
     def parse_test(self, test: TestConfig) -> TestConfig:
-        test.join(self.minor_config)
+        test.join(self.main_config)
         self.parser.parse(test)
         return test
 
@@ -191,11 +221,11 @@ class ConfigParser:
         test.resolve_name(self.dir_path)
         test.resolve_targets(self.targets)
 
-    def set_minor_config(self, config: TestConfig) -> None:
-        self.minor_config = config
+    def set_main_config(self, config: TestConfig) -> None:
+        self.main_config = config
 
-    def parse_minor_config(self, config: TestConfig) -> None:
-        self.parser.parse(self.minor_config, check_required_keys=False)
+    def parse_main_config(self) -> None:
+        self.parser.parse(self.main_config, check_required_keys=False)
 
     def pop_keyword(self, config: Dict[str, Any], keyword: str) -> None:
         value = config.pop(keyword)
@@ -207,16 +237,16 @@ class ConfigParser:
         self,
         config: Dict[str, Any]
     ) -> Tuple[TestConfig, List[TestConfig]]:
-        minor_config = self.pop_keyword(config, 'test')
-        tests = self.pop_keyword(minor_config, 'tests')
-        return TestConfig(minor_config), map(TestConfig, tests)
+        main_config = self.pop_keyword(config, 'test')
+        tests = self.pop_keyword(main_config, 'tests')
+        return TestConfig(main_config), map(TestConfig, tests)
 
     def parse(self, config: Dict[str, Any]) -> List[TestConfig]:
-        minor_config, tests = self.extract_components(config)
+        main_config, tests = self.extract_components(config)
 
-        self.set_minor_config(minor_config)
+        self.set_main_config(main_config)
         try:
-            self.parse_minor_config(minor_config)
+            self.parse_main_config()
             for test in tests:
                 test = self.parse_test(test)
                 self.resolve_test(test)
