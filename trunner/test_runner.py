@@ -1,7 +1,7 @@
 import logging
 
 from .builder import TargetBuilder
-from .config import YAMLParser
+from .config import ConfigParser
 from .device import RunnerFactory
 from .testcase import TestCaseFactory
 
@@ -31,8 +31,9 @@ class TestsRunner:
     def parse_tests(self):
         self.test_configs = []
         for path in self.test_paths:
-            parser = YAMLParser(path, self.targets)
-            testcase_config = parser.parse_test_config()
+            config_parser = ConfigParser(path, self.targets)
+            config = config_parser.load()
+            testcase_config = config_parser.parse(config)
             self.test_configs.extend(testcase_config)
             logging.debug(f"File {path} parsed successfuly\n")
 

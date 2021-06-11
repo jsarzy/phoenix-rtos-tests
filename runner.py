@@ -8,6 +8,7 @@ import sys
 import trunner.config as config
 
 from trunner.test_runner import TestsRunner
+from trunner.config import ConfigParser, TestConfig
 from trunner.tools.color import Color
 
 
@@ -89,9 +90,36 @@ def parse_args():
     return args
 
 
+def resolve_dir_by_target(targets, paths):
+    runner = TestsRunner(targets=targets,
+                         test_paths=paths,
+                         build=False,
+                         flash=False)
+
+    runner.search_for_tests()
+    good_paths = set() 
+
+    for path in runner.test_paths:
+        config_parser = ConfigParser(path, targets)
+        config = config_parser.load()
+        minor_config, tests = config_parser.extract_components(config)
+        for test in tests:
+            test.join_targets(minor_config)
+            config_parser.parser.parse_targets(test)
+            test.resolve_targets(targets)
+            if test['targets']['value']:
+                good_paths.add(path)
+
+    return list(good_paths)
+
+
 def main():
     args = parse_args()
     set_logger(args.log_level)
+    #paths = resolve_dir_by_target(args.target, args.test)
+    #print('\n'.join(map(str, paths)))
+    #return
+
 
     runner = TestsRunner(targets=args.target,
                          test_paths=args.test,
