@@ -1,12 +1,12 @@
 import os
-import pathlib
+from pathlib import Path
 
 import yaml
 
 from .tools.text import remove_prefix
 from typing import Any, Dict, List, Set, Tuple
 
-PHRTOS_PROJECT_DIR = pathlib.Path(os.getcwd())
+PHRTOS_PROJECT_DIR = Path(os.getcwd())
 PHRTOS_TEST_DIR = PHRTOS_PROJECT_DIR / 'phoenix-rtos-tests'
 
 # Default time after pexpect will raise TIEMOUT exception if nothing matches an expected pattern
@@ -49,27 +49,13 @@ class TestConfig(dict):
             return
 
         if 'value' in self['targets']:
-            # We have defined value of targets in our config. Do not overwrite it, just return
+            # The value field is defined. Do not overwrite it, just return.
             return
 
         targets = dict(config['targets'])
         targets.setdefault('value', ALL_TARGETS)
         value = array_value(targets)
         self['targets']['value'] = value
-
-    #def join_targets(self, config: 'TestConfig') -> None:
-    #    if not config.get('targets'):
-    #        return
-
-    #    value = array_value(config['targets'])
-    #    if not self.get('targets'):
-    #        self.setdefault('targets', {'value': value})
-    #    else:
-    #        self['targets'].setdefault('value', value)
-
-    #    #value = array_value(config['targets'])
-    #    #self.setdefault('targets', {})
-    #    #self['targets'].setdefault('value', value)
 
     def join(self, config: 'TestConfig') -> None:
         self.join_targets(config)
@@ -82,12 +68,12 @@ class TestConfig(dict):
         targets = set(targets) & set(allowed_targets)
         self['targets'] = {'value': list(targets)}
 
-    def resolve_name(self, path: pathlib.Path) -> None:
+    def resolve_name(self, path: Path) -> None:
         name = self.get('name')
         if not name:
             raise ParserError('key "name" not found!')
 
-        # Get path relative to phoenix-rtos-project
+        # Get a path relative to phoenix-rtos-project
         relative_path = remove_prefix(str(path), str(PHRTOS_PROJECT_DIR) + '/')
         name = f'{relative_path}/{name}'
         name = name.replace('/', '.')
@@ -107,21 +93,17 @@ def copy_per_target(config: TestConfig) -> List[TestConfig]:
 
 class TestConfigParser:
     ALLOWED_KEYS: Set[str] = {'exec', 'harness', 'ignore', 'name', 'targets', 'timeout', 'type'}
-    REQUIRED_KEYS: Set[str] = {'exec'}
 
-    def __init__(self, path: pathlib.Path) -> None:
-        self.path: pathlib.Path = path
-
-    def set_default_targets(self, config: TestConfig) -> None:
+    def setdefault_targets(self, config: TestConfig) -> None:
         targets = config.get('targets', dict())
         targets.setdefault('value', DEFAULT_TARGETS)
         config['targets'] = targets
 
-    def set_defaults(self, config: TestConfig) -> None:
+    def setdefaults(self, config: TestConfig) -> None:
         config.setdefault('ignore', False)
         config.setdefault('type', 'unit')
         config.setdefault('timeout', PYEXPECT_TIMEOUT)
-        self.set_default_targets(config)
+        self.setdefault_targets(config)
 
     def parse_keywords(self, config: TestConfig) -> None:
         keywords = set(config)
@@ -139,12 +121,12 @@ class TestConfigParser:
             msg = f'wrong test type: {test_type}. Allowed types: {", ".join(allowed_types)}'
             raise ParserError(msg)
 
-    def parse_harness(self, config: TestConfig) -> None:
+    def parse_harness(self, config: TestConfig, test_path: Path) -> None:
         harness = config.get('harness')
         if not harness:
             return
 
-        harness = self.path / harness
+        harness = test_path / harness
         if not harness.exists():
             raise ParserError(f'harness {harness} file not found')
 
@@ -188,21 +170,21 @@ class TestConfigParser:
             if unknown:
                 raise ParserError(f'targets {", ".join(map(str, unknown))} are uknown')
 
-    def parse(self, config: TestConfig, check_required_keys=True) -> None:
+    def parse(self, config: TestConfig, test_path: Path) -> None:
         self.parse_keywords(config)
         self.parse_targets(config)
-        self.parse_harness(config)
+        self.parse_harness(config, test_path)
         self.parse_type(config)
         self.parse_timeout(config)
         self.parse_ignore(config)
 
 
 class ConfigParser:
-    def __init__(self, path: pathlib.Path, targets: List[str]) -> None:
-        self.path: pathlib.Path = path
+    def __init__(self, path: Path, targets: List[str]) -> None:
+        self.path: Path = path
         self.targets: List[str] = targets
         self.dir_path = path.parents[0]
-        self.parser: TestConfigParser = TestConfigParser(self.dir_path)
+        self.parser: TestConfigParser = TestConfigParser()
         self.main_config: TestConfig = None
         self.tests: List[TestConfig] = []
 
@@ -213,8 +195,9 @@ class ConfigParser:
         return config
 
     def parse_test(self, test: TestConfig) -> TestConfig:
+        self.parser.parse(test, self.dir_path)
         test.join(self.main_config)
-        self.parser.parse(test)
+        self.parser.setdefaults(test)
         return test
 
     def resolve_test(self, test: TestConfig) -> None:
@@ -225,12 +208,12 @@ class ConfigParser:
         self.main_config = config
 
     def parse_main_config(self) -> None:
-        self.parser.parse(self.main_config, check_required_keys=False)
+        self.parser.parse(self.main_config, self.dir_path)
 
     def pop_keyword(self, config: Dict[str, Any], keyword: str) -> None:
         value = config.pop(keyword)
         if not value:
-            raise ParserError(f'{self.path}: keyword "{keyword}" not found in test config')
+            raise ParserError(f'{self.path}: keyword "{keyword}" not found in the test config')
         return value
 
     def extract_components(
@@ -245,19 +228,20 @@ class ConfigParser:
         main_config, tests = self.extract_components(config)
 
         self.set_main_config(main_config)
+        parsed_tests = []
+
         try:
             self.parse_main_config()
             for test in tests:
                 test = self.parse_test(test)
                 self.resolve_test(test)
-                self.tests.append(test)
+                parsed_tests.append(test)
         except ParserError as exc:
             raise ParserError(f'{self.path}: {exc}') from exc
 
-        # Split TestConfig by target list, so we'll have a single TestConfig per target
+        # Split TestConfig by the target list, so we'll have a single TestConfig per target
         tests = []
-        for test in self.tests:
+        for test in parsed_tests:
             tests.extend(copy_per_target(test))
-        self.tests = tests
 
-        return self.tests
+        return tests
