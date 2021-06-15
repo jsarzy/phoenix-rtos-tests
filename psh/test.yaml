@@ -1,6 +1,4 @@
 test:
-    exec: psh
-
     tests:
         - name: prompt
           harness: test-prompt.py
