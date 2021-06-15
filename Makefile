@@ -16,7 +16,7 @@ $(call add_test,$(1),$(2),unity)
 endef
 
 # default path for the programs to be installed in rootfs
-DEFAULT_INSTALL_PATH := /bin
+DEFAULT_INSTALL_PATH := /test
 
 # read out all components
 ALL_MAKES := $(shell find . -mindepth 2 -name Makefile)
