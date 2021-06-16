@@ -16,7 +16,7 @@ class TestsRunner:
         self.tests_per_target = {k: [] for k in targets}
         self.build = build
         self.flash = flash
-        self.runners = {target: RunnerFactory.create(target) for target in self.targets}
+        self.runners = None
 
     def search_for_tests(self):
         paths = []
@@ -38,6 +38,7 @@ class TestsRunner:
             logging.debug(f"File {path} parsed successfuly\n")
 
     def run(self):
+        self.runners = {target: RunnerFactory.create(target) for target in self.targets}
         self.search_for_tests()
         self.parse_tests()
 

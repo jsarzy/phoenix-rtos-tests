@@ -34,6 +34,33 @@ def args_file(arg):
     return path
 
 
+def resolve_dir_by_target(targets, paths):
+    runner = TestsRunner(targets=targets,
+                         test_paths=paths,
+                         build=False,
+                         flash=False)
+
+    runner.search_for_tests()
+    good_paths = set()
+
+    for path in runner.test_paths:
+        config_parser = ConfigParser(path, targets)
+        config = config_parser.load()
+        main_config, tests = config_parser.extract_components(config)
+        config_parser.set_main_config(main_config)
+        config_parser.parse_main_config()
+        for test in tests:
+            config_parser.parser.parse_targets(test)
+            test.join_targets(main_config)
+            config_parser.parser.setdefault_targets(test)
+            test.resolve_targets(targets)
+            if test['targets']['value']:
+                good_paths.add(path.parents[0])
+
+    for path in good_paths:
+        print(path)
+
+
 def parse_args():
     logging_level = {
             'debug': logging.DEBUG,
@@ -74,6 +101,12 @@ def parse_args():
                         default=False, action='store_true',
                         help="Board will not be flashed by runner.")
 
+    parser.add_argument("--resolve-dir",
+                        default=False, action='store_true',
+                        help="It prints directories in which there are yamls accepted by the "
+                             "runner. If target flag is added then directories are constricted "
+                             "to targets specified by a user.")
+
     args = parser.parse_args()
 
     args.log_level = logging_level[args.log_level]
@@ -85,41 +118,18 @@ def parse_args():
         # Run on all available targets
         args.target = config.ALL_TARGETS
 
+    if args.resolve_dir:
+        resolve_dir_by_target(args.target, args.test)
+        sys.exit(0)
+
     config.DEVICE_SERIAL = args.serial
 
     return args
 
 
-def resolve_dir_by_target(targets, paths):
-    runner = TestsRunner(targets=targets,
-                         test_paths=paths,
-                         build=False,
-                         flash=False)
-
-    runner.search_for_tests()
-    good_paths = set() 
-
-    for path in runner.test_paths:
-        config_parser = ConfigParser(path, targets)
-        config = config_parser.load()
-        minor_config, tests = config_parser.extract_components(config)
-        for test in tests:
-            test.join_targets(minor_config)
-            config_parser.parser.parse_targets(test)
-            test.resolve_targets(targets)
-            if test['targets']['value']:
-                good_paths.add(path)
-
-    return list(good_paths)
-
-
 def main():
     args = parse_args()
     set_logger(args.log_level)
-    #paths = resolve_dir_by_target(args.target, args.test)
-    #print('\n'.join(map(str, paths)))
-    #return
-
 
     runner = TestsRunner(targets=args.target,
                          test_paths=args.test,
