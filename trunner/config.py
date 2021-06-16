@@ -1,10 +1,11 @@
+import copy
 import os
 from pathlib import Path
 
 import yaml
 
 from .tools.text import remove_prefix
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Tuple
 
 PHRTOS_PROJECT_DIR = Path(os.getcwd())
 PHRTOS_TEST_DIR = PHRTOS_PROJECT_DIR / 'phoenix-rtos-tests'
@@ -68,22 +69,11 @@ class TestConfig(dict):
         targets = set(targets) & set(allowed_targets)
         self['targets'] = {'value': list(targets)}
 
-    def resolve_name(self, path: Path) -> None:
-        name = self.get('name')
-        if not name:
-            raise ParserError('key "name" not found!')
-
-        # Get a path relative to phoenix-rtos-project
-        relative_path = remove_prefix(str(path), str(PHRTOS_PROJECT_DIR) + '/')
-        name = f'{relative_path}/{name}'
-        name = name.replace('/', '.')
-        self['name'] = name
-
 
 def copy_per_target(config: TestConfig) -> List[TestConfig]:
     tests = []
     for target in array_value(config['targets']):
-        test = config.copy()
+        test = copy.deepcopy(config)
         del test['targets']
         test['target'] = target
         tests.append(test)
@@ -92,33 +82,45 @@ def copy_per_target(config: TestConfig) -> List[TestConfig]:
 
 
 class TestConfigParser:
-    ALLOWED_KEYS: Set[str] = {'exec', 'harness', 'ignore', 'name', 'targets', 'timeout', 'type'}
+    KEYWORDS: Tuple[str] = ('exec', 'harness', 'ignore', 'name', 'targets', 'timeout', 'type')
+    TEST_TYPES: Tuple[str] = ('unit', 'harness')
 
     def setdefault_targets(self, config: TestConfig) -> None:
         targets = config.get('targets', dict())
         targets.setdefault('value', DEFAULT_TARGETS)
         config['targets'] = targets
 
+    def setdefault_name(self, config: TestConfig) -> None:
+        name = config.get('name')
+        if name:
+            return
+
+        name = config.get('exec')
+        if not name:
+            raise ParserError('Cannot resolve the test name')
+
+        config['name'] = name
+
     def setdefaults(self, config: TestConfig) -> None:
         config.setdefault('ignore', False)
         config.setdefault('type', 'unit')
         config.setdefault('timeout', PYEXPECT_TIMEOUT)
+        self.setdefault_name(config)
         self.setdefault_targets(config)
 
     def parse_keywords(self, config: TestConfig) -> None:
         keywords = set(config)
-        uknown = keywords - self.ALLOWED_KEYS
+        uknown = keywords - set(self.KEYWORDS)
         if uknown:
             raise ParserError(f'Uknown keys: {", ".join(map(str, uknown))}')
 
     def parse_type(self, config: TestConfig) -> None:
-        allowed_types = ('unit', 'harness')
         test_type = config.get('type')
         if not test_type:
             return
 
-        if test_type not in allowed_types:
-            msg = f'wrong test type: {test_type}. Allowed types: {", ".join(allowed_types)}'
+        if test_type not in self.TEST_TYPES:
+            msg = f'wrong test type: {test_type}. Allowed types: {", ".join(self.TEST_TYPES)}'
             raise ParserError(msg)
 
     def parse_harness(self, config: TestConfig, test_path: Path) -> None:
@@ -135,6 +137,18 @@ class TestConfigParser:
 
         config['type'] = 'harness'
         config['harness'] = harness
+
+    def parse_name(self, config: TestConfig, test_path: Path) -> None:
+        name = config.get('name')
+        if not name:
+            return
+
+        # Get a path relative to phoenix-rtos-project
+        print(str(PHRTOS_PROJECT_DIR))
+        relative_path = remove_prefix(str(test_path), str(PHRTOS_PROJECT_DIR) + '/')
+        name = f'{relative_path}/{name}'
+        name = name.replace('/', '.')
+        config['name'] = name
 
     def parse_ignore(self, config: TestConfig) -> None:
         ignore = config.get('ignore', False)
@@ -153,16 +167,23 @@ class TestConfigParser:
             except ValueError:
                 raise ParserError(f'wrong timeout: {timeout}. It must be an integer with base 10')
 
+        config['timeout'] = timeout
+
     @staticmethod
-    def is_array(array):
+    def is_array(array: Dict[str, List]) -> bool:
         unknown = array.keys() - {'value', 'include', 'exclude'}
         if unknown:
             raise ParserError(f'array: unknown keys: {", ".join(map(str, unknown))}')
+
+        return True
 
     def parse_targets(self, config: TestConfig) -> None:
         targets = config.get('targets')
         if not targets:
             return
+
+        if not isinstance(targets, dict):
+            raise ParserError('"targets" should be a dict with "value", "include", "exclude" keys!')
 
         TestConfigParser.is_array(targets)
         for value in targets.values():
@@ -186,7 +207,6 @@ class ConfigParser:
         self.dir_path = path.parents[0]
         self.parser: TestConfigParser = TestConfigParser()
         self.main_config: TestConfig = None
-        self.tests: List[TestConfig] = []
 
     def load(self) -> Dict[str, Any]:
         with open(self.path, 'r') as f_yaml:
@@ -201,7 +221,6 @@ class ConfigParser:
         return test
 
     def resolve_test(self, test: TestConfig) -> None:
-        test.resolve_name(self.dir_path)
         test.resolve_targets(self.targets)
 
     def set_main_config(self, config: TestConfig) -> None:
@@ -210,8 +229,8 @@ class ConfigParser:
     def parse_main_config(self) -> None:
         self.parser.parse(self.main_config, self.dir_path)
 
-    def pop_keyword(self, config: Dict[str, Any], keyword: str) -> None:
-        value = config.pop(keyword)
+    def pop_keyword(self, config: Dict[str, Any], keyword: str) -> Any:
+        value = config.pop(keyword, None)
         if not value:
             raise ParserError(f'{self.path}: keyword "{keyword}" not found in the test config')
         return value
@@ -222,11 +241,10 @@ class ConfigParser:
     ) -> Tuple[TestConfig, List[TestConfig]]:
         main_config = self.pop_keyword(config, 'test')
         tests = self.pop_keyword(main_config, 'tests')
-        return TestConfig(main_config), map(TestConfig, tests)
+        return TestConfig(main_config), list(map(TestConfig, tests))
 
     def parse(self, config: Dict[str, Any]) -> List[TestConfig]:
         main_config, tests = self.extract_components(config)
-
         self.set_main_config(main_config)
         parsed_tests = []
 
