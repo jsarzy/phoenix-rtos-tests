@@ -430,7 +430,7 @@ class HostRunner(Runner):
         if test.skipped():
             return
 
-        test_path = PHRTOS_PROJECT_DIR / f'_boot/{test.target}/{test.exec_bin}'
+        test_path = PHRTOS_PROJECT_DIR / f'_boot/test/{test.target}/{test.exec_bin}'
 
         try:
             proc = pexpect.spawn(str(test_path), encoding='utf-8', timeout=test.timeout)
