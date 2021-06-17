@@ -1,12 +1,25 @@
-import logging
-import os
-import pathlib
+import copy
+import sys
+from pathlib import Path
 
 import yaml
 
 from .tools.text import remove_prefix
+from typing import Any, Dict, List, Tuple
 
-PHRTOS_PROJECT_DIR = pathlib.Path(os.getcwd())
+
+def resolve_phrtos_dir() -> Path:
+    path = Path.cwd().absolute()
+    try:
+        idx = path.parts.index('phoenix-rtos-project')
+    except ValueError:
+        print('Runner must be lanuched from the phoenix-rtos-project directory')
+        sys.exit(1)
+
+    return Path(*path.parts[:idx+1])
+
+
+PHRTOS_PROJECT_DIR = resolve_phrtos_dir()
 PHRTOS_TEST_DIR = PHRTOS_PROJECT_DIR / 'phoenix-rtos-tests'
 
 # Default time after pexpect will raise TIEMOUT exception if nothing matches an expected pattern
@@ -25,145 +38,240 @@ DEVICE_TARGETS = ['armv7m7-imxrt106x']
 DEVICE_SERIAL = "/dev/ttyACM0"
 
 
-class YAMLParserError(Exception):
-    """Exception raised when config has wrong format"""
-
-    def __init__(self, parser, message="Parser error"):
-        message = f"{parser.path}:\n{message}"
-        super().__init__(message)
+class ParserError(Exception):
+    pass
 
 
-class YAMLParser:
-    """This class is responsible for parsing YAML config that defines test cases"""
+def array_value(array: Dict[str, List[str]]) -> List[str]:
+    value = set(array.get('value', []))
+    value |= set(array.get('include', []))
+    value -= set(array.get('exclude', []))
 
-    def __init__(self, path=None, targets=None):
-        self.config = None
-        if targets is None:
-            targets = ALL_TARGETS
-        self.targets = targets
-        self.parsed_tests = []
+    return list(value)
 
-        if path is None:
-            self.path = ''
+
+class TestConfig(dict):
+    def __init__(self, config: Dict[str, Any]) -> None:
+        self.update(**config)
+
+    def join_targets(self, config: 'TestConfig') -> None:
+        if 'targets' not in config:
+            return
+        elif 'targets' not in self:
+            self['targets'] = config['targets']
             return
 
-        self.path = path
-        self.load_yaml(self.path)
-        # Current path is /example/test/test.yaml - get rid of test.yaml in path
-        self.path = self.path.parents[0]
+        if 'value' in self['targets']:
+            # The value field is defined. Do not overwrite it, just return.
+            return
 
-    def load_yaml(self, path):
-        with open(path, 'r') as f_yaml:
+        targets = dict(config['targets'])
+        targets.setdefault('value', ALL_TARGETS)
+        value = array_value(targets)
+        self['targets']['value'] = value
+
+    def join(self, config: 'TestConfig') -> None:
+        self.join_targets(config)
+        for key in config:
+            if key not in self:
+                self[key] = config[key]
+
+    def resolve_targets(self, allowed_targets: List[str]) -> None:
+        targets = array_value(self['targets'])
+        targets = set(targets) & set(allowed_targets)
+        self['targets'] = {'value': list(targets)}
+
+
+def copy_per_target(config: TestConfig) -> List[TestConfig]:
+    tests = []
+    for target in array_value(config['targets']):
+        test = copy.deepcopy(config)
+        del test['targets']
+        test['target'] = target
+        tests.append(test)
+
+    return tests
+
+
+class TestConfigParser:
+    KEYWORDS: Tuple[str] = ('exec', 'harness', 'ignore', 'name', 'targets', 'timeout', 'type')
+    TEST_TYPES: Tuple[str] = ('unit', 'harness')
+
+    def setdefault_targets(self, config: TestConfig) -> None:
+        targets = config.get('targets', dict())
+        targets.setdefault('value', DEFAULT_TARGETS)
+        config['targets'] = targets
+
+    def setdefault_name(self, config: TestConfig) -> None:
+        name = config.get('name')
+        if name:
+            return
+
+        name = config.get('exec')
+        if not name:
+            raise ParserError('Cannot resolve the test name')
+
+        config['name'] = name
+
+    def setdefaults(self, config: TestConfig) -> None:
+        config.setdefault('ignore', False)
+        config.setdefault('type', 'unit')
+        config.setdefault('timeout', PYEXPECT_TIMEOUT)
+        self.setdefault_name(config)
+        self.setdefault_targets(config)
+
+    def parse_keywords(self, config: TestConfig) -> None:
+        keywords = set(config)
+        uknown = keywords - set(self.KEYWORDS)
+        if uknown:
+            raise ParserError(f'Uknown keys: {", ".join(map(str, uknown))}')
+
+    def parse_type(self, config: TestConfig) -> None:
+        test_type = config.get('type')
+        if not test_type:
+            return
+
+        if test_type not in self.TEST_TYPES:
+            msg = f'wrong test type: {test_type}. Allowed types: {", ".join(self.TEST_TYPES)}'
+            raise ParserError(msg)
+
+    def parse_harness(self, config: TestConfig, test_path: Path) -> None:
+        harness = config.get('harness')
+        if not harness:
+            return
+
+        harness = test_path / harness
+        if not harness.exists():
+            raise ParserError(f'harness {harness} file not found')
+
+        if not harness.suffix == '.py':
+            raise ParserError(f'harness {harness} must be python script (with .py extension)')
+
+        config['type'] = 'harness'
+        config['harness'] = harness
+
+    def parse_name(self, config: TestConfig, test_path: Path) -> None:
+        name = config.get('name')
+        if not name:
+            return
+
+        # Get a path relative to phoenix-rtos-project
+        relative_path = remove_prefix(str(test_path), str(PHRTOS_PROJECT_DIR) + '/')
+        name = f'{relative_path}/{name}'
+        name = name.replace('/', '.')
+        config['name'] = name
+
+    def parse_ignore(self, config: TestConfig) -> None:
+        ignore = config.get('ignore', False)
+
+        if not isinstance(ignore, bool):
+            raise ParserError(f'ignore must be a boolean value (true/false) not {ignore}')
+
+    def parse_timeout(self, config: TestConfig) -> None:
+        timeout = config.get('timeout')
+        if not timeout:
+            return
+
+        if not isinstance(timeout, int):
             try:
-                self.config = yaml.safe_load(f_yaml)
-            except yaml.YAMLError as exc:
-                raise YAMLParserError(self, exc) from exc
+                timeout = int(timeout)
+            except ValueError:
+                raise ParserError(f'wrong timeout: {timeout}. It must be an integer with base 10')
 
-    def parse_keywords(self, test):
-        allowed_keys = ('exec', 'type', 'harness', 'name', 'ignore', 'timeout', 'targets')
-        mandatory_keys = ('exec', 'name')
-
-        unnecessary_keys = set(test) - set(allowed_keys)
-        if unnecessary_keys:
-            logging.debug(f"Dropping unnecessary keys: {unnecessary_keys}\n")
-            for key in unnecessary_keys:
-                test.pop(key)
-
-        for key in mandatory_keys:
-            if key not in test:
-                raise YAMLParserError(self, f"key {key} not found in test config")
-
-    def parse_name(self, test):
-        # Extend test name with path
-        test_path = remove_prefix(str(self.path), str(PHRTOS_PROJECT_DIR) + '/')
-        name = f"{test_path}/{test['name']}"
-        test['name'] = name.replace('/', '.')
-
-    def parse_harness(self, test):
-        test['type'] = 'harness'
-        test['harness'] = self.path / test['harness']
-
-        if not test['harness'].exists():
-            raise YAMLParserError(self, f"harness {test['harness']} file not found")
-
-        if not str(test['harness']).endswith('.py'):
-            raise YAMLParserError(self, "harness file must has .py extension")
+        config['timeout'] = timeout
 
     @staticmethod
-    def parse_array_value(array):
-        value = set(array.get('value', []))
-        value |= set(array.get('include', []))
-        value -= set(array.get('exclude', []))
+    def is_array(array: Dict[str, List]) -> bool:
+        unknown = array.keys() - {'value', 'include', 'exclude'}
+        if unknown:
+            raise ParserError(f'array: unknown keys: {", ".join(map(str, unknown))}')
 
+        return True
+
+    def parse_targets(self, config: TestConfig) -> None:
+        targets = config.get('targets')
+        if not targets:
+            return
+
+        if not isinstance(targets, dict):
+            raise ParserError('"targets" should be a dict with "value", "include", "exclude" keys.')
+
+        TestConfigParser.is_array(targets)
+        for value in targets.values():
+            unknown = set(value) - set(ALL_TARGETS)
+            if unknown:
+                raise ParserError(f'targets {", ".join(map(str, unknown))} are uknown')
+
+    def parse(self, config: TestConfig, test_path: Path) -> None:
+        self.parse_keywords(config)
+        self.parse_targets(config)
+        self.parse_harness(config, test_path)
+        self.parse_type(config)
+        self.parse_timeout(config)
+        self.parse_ignore(config)
+        self.parse_name(config, test_path)
+
+
+class ConfigParser:
+    def __init__(self, path: Path, targets: List[str]) -> None:
+        self.path: Path = path
+        self.targets: List[str] = targets
+        self.dir_path = path.parents[0]
+        self.parser: TestConfigParser = TestConfigParser()
+        self.main_config: TestConfig = None
+
+    def load(self) -> Dict[str, Any]:
+        with open(self.path, 'r') as f_yaml:
+            config = yaml.safe_load(f_yaml)
+
+        return config
+
+    def parse_test(self, test: TestConfig) -> TestConfig:
+        self.parser.parse(test, self.dir_path)
+        test.join(self.main_config)
+        self.parser.setdefaults(test)
+        return test
+
+    def resolve_test(self, test: TestConfig) -> None:
+        test.resolve_targets(self.targets)
+
+    def set_main_config(self, config: TestConfig) -> None:
+        self.main_config = config
+
+    def parse_main_config(self) -> None:
+        self.parser.parse(self.main_config, self.dir_path)
+
+    def pop_keyword(self, config: Dict[str, Any], keyword: str) -> Any:
+        value = config.pop(keyword, None)
+        if not value:
+            raise ParserError(f'{self.path}: keyword "{keyword}" not found in the test config')
         return value
 
-    def parse_target(self, test):
-        target_array = test.get('targets', dict())
-        target_array.setdefault('value', DEFAULT_TARGETS)
+    def extract_components(
+        self,
+        config: Dict[str, Any]
+    ) -> Tuple[TestConfig, List[TestConfig]]:
+        main_config = self.pop_keyword(config, 'test')
+        tests = self.pop_keyword(main_config, 'tests')
+        return TestConfig(main_config), list(map(TestConfig, tests))
 
-        targets = YAMLParser.parse_array_value(target_array)
-        unknown_targets = targets - set(ALL_TARGETS)
-        if unknown_targets:
-            raise YAMLParserError(self, f"wrong target: {', '.join(map(str, unknown_targets))}")
+    def parse(self, config: Dict[str, Any]) -> List[TestConfig]:
+        main_config, tests = self.extract_components(config)
+        self.set_main_config(main_config)
+        parsed_tests = []
 
-        targets &= set(self.targets)
-        test['targets'] = {'value': list(targets)}
+        try:
+            self.parse_main_config()
+            for test in tests:
+                test = self.parse_test(test)
+                self.resolve_test(test)
+                parsed_tests.append(test)
+        except ParserError as exc:
+            raise ParserError(f'{self.path}: {exc}') from exc
 
-    def parse_test_case(self, test):
-        self.parse_keywords(test)
-        self.parse_name(test)
-        self.parse_target(test)
-        # If type is not known assume that it's a unit test
-        test.setdefault('type', 'unit')
-        test.setdefault('timeout', PYEXPECT_TIMEOUT)
+        # Split TestConfig by the target list, so we'll have a single TestConfig per target
+        tests = []
+        for test in parsed_tests:
+            tests.extend(copy_per_target(test))
 
-        test.setdefault('ignore', False)
-        if not isinstance(test['ignore'], bool):
-            test['ignore'] = False
-
-        if test.get('harness'):
-            self.parse_harness(test)
-
-        # Copy test per target
-        test_case = []
-        for target in test['targets']['value']:
-            test_by_target = test.copy()
-            test_by_target['target'] = target
-            test_case.append(test_by_target)
-            del test_by_target['targets']
-
-        return test_case
-
-    def inherit_array_value(self, test, keyword):
-        global_array = self.config.get(keyword)
-        array = test.get(keyword)
-
-        if global_array and array:
-            array.setdefault('value', global_array['value'])
-
-    def inherit_global_keywords(self, test):
-        self.inherit_array_value(test, 'targets')
-
-        for key in self.config:
-            if key not in test:
-                test[key] = self.config[key]
-
-    def parse_test_config(self):
-        if 'test' not in self.config:
-            raise YAMLParserError(self, 'Keyword "test" not found in test config')
-
-        self.config = self.config['test']
-        if 'tests' not in self.config:
-            raise YAMLParserError(self, 'Keyword "tests" not found in test config')
-
-        if 'targets' in self.config:
-            self.parse_target(self.config)
-
-        tests_configs = self.config.pop('tests')
-        for test_config in tests_configs:
-            # Combine 'local' test config and 'global' config
-            self.inherit_global_keywords(test_config)
-            test_case = self.parse_test_case(test_config)
-            self.parsed_tests.extend(test_case)
-
-        return self.parsed_tests
+        return tests
