@@ -1,5 +1,4 @@
 import copy
-import os
 from pathlib import Path
 
 import yaml
@@ -7,7 +6,19 @@ import yaml
 from .tools.text import remove_prefix
 from typing import Any, Dict, List, Tuple
 
-PHRTOS_PROJECT_DIR = Path(os.getcwd())
+
+def resolve_phrtos_dir() -> Path:
+    path = Path.cwd().absolute()
+    try:
+        idx = path.parts.index('phoenix-rtos-project')
+    except ValueError:
+        print('Runner must be lanuched from the phoenix-rtos-project directory')
+        sys.exit(1)
+
+    return Path(*path.parts[:idx+1])
+
+
+PHRTOS_PROJECT_DIR = resolve_phrtos_dir()
 PHRTOS_TEST_DIR = PHRTOS_PROJECT_DIR / 'phoenix-rtos-tests'
 
 # Default time after pexpect will raise TIEMOUT exception if nothing matches an expected pattern
@@ -183,7 +194,7 @@ class TestConfigParser:
             return
 
         if not isinstance(targets, dict):
-            raise ParserError('"targets" should be a dict with "value", "include", "exclude" keys!')
+            raise ParserError('"targets" should be a dict with "value", "include", "exclude" keys.')
 
         TestConfigParser.is_array(targets)
         for value in targets.values():
