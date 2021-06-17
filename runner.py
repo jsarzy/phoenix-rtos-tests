@@ -8,6 +8,7 @@ import sys
 import trunner.config as config
 
 from trunner.test_runner import TestsRunner
+from trunner.config import ConfigParser
 from trunner.tools.color import Color
 
 
@@ -31,6 +32,51 @@ def args_file(arg):
 
     path = path.resolve()
     return path
+
+
+def resolve_test_bins(targets, paths):
+    runner = TestsRunner(targets=targets,
+                         test_paths=paths,
+                         build=False,
+                         flash=False)
+
+    runner.search_for_tests()
+    execs = set()
+
+    for path in runner.test_paths:
+        config_parser = ConfigParser(path, targets)
+        config = config_parser.load()
+        main_config, tests = config_parser.extract_components(config)
+        config_parser.set_main_config(main_config)
+        config_parser.parse_main_config()
+
+        for test in tests:
+            config_parser.parser.parse_targets(test)
+
+            # Join targets
+            test.join_targets(main_config)
+            config_parser.parser.setdefault_targets(test)
+            test.resolve_targets(targets)
+
+            if not test['targets']['value']:
+                # This test is not for our target
+                continue
+
+            # Join 'exec' field
+            if 'exec' not in test:
+                exec_bin = main_config.get('exec')
+                if exec_bin:
+                    test['exec'] = exec_bin
+                else:
+                    # There is no exec bin defined in test
+                    continue
+
+            # Some tests use args for binary (./bin arg1 arg2 etc.)
+            exec_bin = test['exec'].split()[0]
+            execs.add(exec_bin)
+
+    for binary in execs:
+        print(binary)
 
 
 def parse_args():
@@ -73,6 +119,12 @@ def parse_args():
                         default=False, action='store_true',
                         help="Board will not be flashed by runner.")
 
+    parser.add_argument("--resolve-bins",
+                        default=False, action='store_true',
+                        help="It prints binaries defined in the yamls configs accepted by the "
+                             "runner. If the target flag is added then directories are constricted "
+                             "to targets specified by a user. The same goes for the test flag.")
+
     args = parser.parse_args()
 
     args.log_level = logging_level[args.log_level]
@@ -83,6 +135,10 @@ def parse_args():
     if not args.target:
         # Run on all available targets
         args.target = config.ALL_TARGETS
+
+    if args.resolve_bins:
+        resolve_test_bins(args.target, args.test)
+        sys.exit(0)
 
     config.DEVICE_SERIAL = args.serial
 
