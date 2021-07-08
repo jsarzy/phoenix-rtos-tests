@@ -5,6 +5,7 @@ name: ci
 on:
   push:
     branches:
+      - runner
       - master
       - 'feature/*'
   pull_request:
@@ -19,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        target: ['armv7a7-imx6ull', 'armv7a9-zynq7000', 'armv7m7-imxrt106x', 'armv7m7-imxrt117x', 'armv7m4-stm32l4x6', 'host-pc', 'ia32-generic', 'riscv64-spike', 'riscv64-virt']
+        target: ['armv7m7-imxrt106x', 'host-pc', 'ia32-generic']
         include:
           - target: 'ia32-generic'
             syspage: 'psh pc-ata uart16550'
@@ -68,9 +69,9 @@ jobs:
             _boot
             rootfs-${{ matrix.target }}.tar
 
-  test:
+  test-emu:
     needs: build
-    name: run tests
+    name: run tests on emulators
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -104,3 +105,40 @@ jobs:
         uses: ./.github/actions/phoenix-runner
         with:
           target: ${{ matrix.target }}
+
+  test-hw:
+    needs: build
+    name: run tests on hardware
+    runs-on: ${{ matrix.target }}
+    continue-on-error: true
+    strategy:
+      matrix:
+        target: ['armv7m7-imxrt106x']
+
+    steps:
+      - name: Checkout phoenix-rtos-project
+        uses: actions/checkout@v2
+        with:
+          repository: phoenix-rtos/phoenix-rtos-project
+          submodules: recursive
+
+      # step 2: update the submodule
+      - name: Update submodule ${{ github.event.repository.name }}
+        working-directory: ${{ github.event.repository.name }}
+        run: |
+          git fetch --recurse-submodules=no --force ${{ github.event.repository.git_url }} "+refs/heads/*:refs/remotes/origin/*"
+          git fetch --recurse-submodules=no --force ${{ github.event.repository.git_url }} "+refs/pull/*/head:refs/remotes/origin/pr/*"
+          git checkout ${{ github.sha }} || git checkout ${{ github.event.pull_request.head.sha }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v2
+        with:
+          name: phoenix-rtos-${{ matrix.target }}
+
+      - name: Untar rootfs
+        working-directory: _fs
+        run: tar -xvf ../rootfs-${{ matrix.target }}.tar
+
+      - name: Test runner
+        run: |
+          python3 ./phoenix-rtos-tests/runner.py -T${{ matrix.target }}
