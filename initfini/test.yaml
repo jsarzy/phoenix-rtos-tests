@@ -1,4 +1,6 @@
 test:
+    targets:
+        include: [armv7m7-imxrt106x]
     tests:
         - name: main
           harness: test.py
